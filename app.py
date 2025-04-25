@@ -4,15 +4,31 @@ import torch
 import pickle
 import re
 import os
+import gc  # Added missing import
 import numpy as np
 from datetime import datetime
 import pandas as pd
+import torchvision.transforms as transforms
+from PIL import Image
+import io
+import base64
 
-# Initialize Flask app
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+
 app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# Create upload folder if it doesn't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Global variables for model and preprocessors
 model = None
+image_model = None
 tokenizer = None
 label_encoder = None
 metadata = None
@@ -83,7 +99,7 @@ class TextTokenizer:
 
 # Improved sequence padding function
 def pad_sequences(sequences, maxlen=None, padding='post'):
-    """Pad sequences to the same length."""
+    """Pad sequences to the same length."""    
     if maxlen is None:
         maxlen = max(len(seq) for seq in sequences)
     
@@ -214,22 +230,31 @@ def predict_spam(text):
         'sequence_length': len(sequence)
     }
 
-def load_model():
-    """Load the trained model and preprocessors."""
-    global model, tokenizer, label_encoder, metadata
+def load_models():
+    """Load both text and image models."""
+    global model, image_model, tokenizer, label_encoder, metadata
+    success = True
     
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+    
+    # Load text model and preprocessors first
     try:
         # Load metadata
         with open('models/metadata.pickle', 'rb') as f:
             metadata = pickle.load(f)
+        print("Loaded metadata")
         
         # Load tokenizer
         with open('models/tokenizer.pickle', 'rb') as f:
             tokenizer = pickle.load(f)
+        print("Loaded tokenizer")
         
         # Load label encoder
         with open('models/label_encoder.pickle', 'rb') as f:
             label_encoder = pickle.load(f)
+        print("Loaded label encoder")
         
         # Initialize model
         model = SpamDetectorLSTM(
@@ -242,15 +267,76 @@ def load_model():
         # Load trained weights
         checkpoint = torch.load('models/best_spam_model.pt', map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
+        model = model.to(device)
         model.eval()
         
-        print(f"Model loaded successfully with accuracy: {checkpoint.get('accuracy', 'N/A'):.2f}%")
-        return True
-    
+        print(f"Text model loaded successfully with accuracy: {checkpoint.get('accuracy', 'N/A'):.2f}%")
     except Exception as e:
-        print(f"Error loading model: {e}")
-        return False
+        print(f"Error loading text model: {e}")
+        success = False
+        return success
+    
+    # Initialize and load image model
+    try:
+        image_model = SpamImageClassifier()
+        checkpoint = torch.load('models/spam_image_model.pt', map_location=device)
+        image_model.load_state_dict(checkpoint['model_state_dict'])
+        image_model = image_model.to(device)
+        image_model.eval()
+        print("Image model loaded successfully")
+    except Exception as e:
+        print(f"Error loading image model: {e}")
+        success = False
+    
+    return success
+
+# Image model definition
+class SpamImageClassifier(torch.nn.Module):
+    def __init__(self, num_classes=2):
+        super(SpamImageClassifier, self).__init__()
+        # Use ResNet18 as base
+        self.model = torch.hub.load('pytorch/vision:v0.10.0', 'resnet18', pretrained=True)
+        
+        # Freeze early layers
+        for param in list(self.model.parameters())[:-8]:
+            param.requires_grad = False
+            
+        # Modify the final layers for better feature extraction
+        num_ftrs = self.model.fc.in_features
+        self.model.fc = torch.nn.Sequential(
+            torch.nn.Dropout(0.4),
+            torch.nn.Linear(num_ftrs, 512),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.4),
+            torch.nn.Linear(512, num_classes)
+        )
+        
+        # Add batch normalization
+        self.model.avgpool = torch.nn.Sequential(
+            torch.nn.BatchNorm2d(512),
+            torch.nn.AdaptiveAvgPool2d((1, 1))
+        )
+    
+    def forward(self, x):
+        return self.model(x)
+
+# Image processing imports and setup
+# Image transformation pipeline
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+def process_image(image_bytes):
+    """Process uploaded image bytes into tensor."""
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        image_tensor = transform(image).unsqueeze(0)
+        return image_tensor
+    except Exception as e:
+        print(f"Error processing image: {e}")
+        return None
 
 # Routes
 @app.route('/')
@@ -289,35 +375,95 @@ def analyze():
 @app.route('/predict', methods=['POST'])
 def predict():
     """Handle prediction requests from the frontend."""
-    # Check if the request has JSON content
-    if request.is_json:
-        data = request.get_json()
-        text = data.get('text', '')
-    else:
-        # Handle form data
-        text = request.form.get('text', '')
-        # If not in form data, try to get it from the request body
-        if not text:
-            text = request.data.decode('utf-8')
-    
-    if not text or not text.strip():
-        return jsonify({'error': 'No text provided'}), 400
-    
     try:
-        result = predict_spam(text)
+        # Handle form data from textarea
+        message = request.form.get('message')
         
-        # Add timestamp
-        result['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not message or not message.strip():
+            return jsonify({
+                'error': 'No text provided',
+                'prediction': 'Unknown',
+                'confidence': '0.00%'
+            }), 400
+
+        # Get prediction
+        result = predict_spam(message)
         
-        # Log the prediction (optional)
-        with open('logs/predictions.log', 'a') as log_file:
-            log_entry = f"{result['timestamp']} | {result['prediction']} | {result['confidence']:.2f}% | {text[:50]}\n"
-            log_file.write(log_entry)
+        return jsonify({
+            'prediction': result['prediction'],
+            'confidence': f"{result['confidence']:.2f}%",
+            'text': message
+        })
+        
+    except Exception as e:
+        print(f"Error in prediction: {str(e)}")
+        return jsonify({
+            'error': 'Error processing request',
+            'prediction': 'Unknown',
+            'confidence': '0.00%'
+        }), 500
+
+# Image prediction route
+@app.route('/predict_image', methods=['POST'])
+def predict_image_route():
+    """Handle image prediction requests."""
+    try:
+        if 'image' not in request.files:
+            return jsonify({
+                'error': 'No image file provided',
+                'prediction': 'Unknown',
+                'confidence': '0.00%'
+            }), 400
+
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({
+                'error': 'No selected file',
+                'prediction': 'Unknown',
+                'confidence': '0.00%'
+            }), 400
+
+        if not file or not allowed_file(file.filename):
+            return jsonify({
+                'error': 'Invalid file type',
+                'prediction': 'Unknown',
+                'confidence': '0.00%'
+            }), 400
+
+        # Process the image
+        image_bytes = file.read()
+        image_tensor = process_image(image_bytes)
+        
+        if image_tensor is None:
+            return jsonify({
+                'error': 'Error processing image',
+                'prediction': 'Unknown',
+                'confidence': '0.00%'
+            }), 400
+
+        # Move to device and predict
+        image_tensor = image_tensor.to(device)
+        
+        with torch.no_grad():
+            outputs = image_model(image_tensor)
+            probabilities = torch.softmax(outputs, dim=1)
+            prediction = torch.argmax(probabilities, dim=1).item()
+            confidence = float(probabilities[0][prediction]) * 100
+
+        result = {
+            'prediction': 'Spam' if prediction == 1 else 'Ham',
+            'confidence': f"{confidence:.2f}%"
+        }
         
         return jsonify(result)
-    
+
     except Exception as e:
-        return jsonify({'error': f'Prediction error: {str(e)}'}), 500
+        print(f"Error predicting image: {str(e)}")
+        return jsonify({
+            'error': 'Error processing image',
+            'prediction': 'Unknown',
+            'confidence': '0.00%'
+        }), 500
 
 @app.route('/health')
 def health_check():
@@ -343,20 +489,24 @@ def model_stats():
     
     return jsonify(stats)
 
+
 # Create necessary directories
 def setup():
     os.makedirs('logs', exist_ok=True)
 
 if __name__ == '__main__':
-    # Load the model
-    with app.app_context():
-        setup()
-
-
-    print("Loading the spam detection model...")
-    if load_model():
-        print("Model loaded successfully, starting the server.")
+    # Clean up any GPU memory before starting
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    # Create necessary directories
+    os.makedirs('logs', exist_ok=True)
+    
+    print("Loading models...")
+    if load_models():
+        print("All models loaded successfully, starting the server.")
         # Start the server
         app.run(debug=True, host='0.0.0.0', port=5000)
     else:
-        print("Failed to load the model. Please ensure all model files are available.")
+        print("Failed to load one or more models. Please ensure all model files are available.")
