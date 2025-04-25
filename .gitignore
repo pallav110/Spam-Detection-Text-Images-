@@ -1,0 +1,15 @@
+/.venv
+/models
+/visualizations
+/testpush.txt
+/.DS_Store
+/.idea
+/.vscode
+/.pytest_cache
+/.mypy_cache
+/.coverage
+/.coverage.*
+/.pytest_cache
+/*.log
+/logs
+data/processed

@@ -1,1 +1,11 @@
-sdfdfefdffdvdc
+Email or sms spam detection using tenserflow 
+With both text and image dataset
+I have a dataset in this directory in soam-detection folder alright 
+remove the values that doesnt have , ham/spam , and resample the whole dataset so that
+model training works flawleselsly
+The dataset is present in the data folder , for the text
+i wanna train a model so accurately without overfitting such that it classifies all the text perfectly as ham or spam
+lets first do this , then i also have the image dataset but lets not talk about it now 
+lets focus here
+after the model is trained and stored and tested , i wanna implement a flask based app ,just for text  , with a good ui/ux
+an elegant theme and extra stuff just to make it look handy
